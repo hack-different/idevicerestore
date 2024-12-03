@@ -38,15 +38,12 @@
 
 #include <curl/curl.h>
 
-#ifdef HAVE_OPENSSL
-#include <openssl/sha.h>
-#else
-#include "sha512.h"
-#define SHA384 sha384
-#endif
+#include <libimobiledevice-glue/sha.h>
+#include <libimobiledevice-glue/utils.h>
+#include <libtatsu/tss.h>
 
+#include "ace3.h"
 #include "dfu.h"
-#include "tss.h"
 #include "img3.h"
 #include "img4.h"
 #include "ipsw.h"
@@ -72,7 +69,7 @@ static struct option longopts[] = {
 	{ "erase",          no_argument,       NULL, 'e' },
 	{ "custom",         no_argument,       NULL, 'c' },
 	{ "latest",         no_argument,       NULL, 'l' },
-	{ "cydia",          no_argument,       NULL, 's' },
+	{ "server",         required_argument, NULL, 's' },
 	{ "exclude",        no_argument,       NULL, 'x' },
 	{ "shsh",           no_argument,       NULL, 't' },
 	{ "keep-pers",      no_argument,       NULL, 'k' },
@@ -132,8 +129,8 @@ static void usage(int argc, char* argv[], int err)
 	"\n" \
 	"Advanced/experimental options:\n"
 	"  -c, --custom          Restore with a custom firmware (requires bootrom exploit)\n" \
-	"  -s, --cydia           Use Cydia's signature service instead of Apple's\n" \
-	"  -x, --exclude         Exclude nor/baseband upgrade\n" \
+	"  -s, --server URL      Override default signing server request URL\n" \
+	"  -x, --exclude         Exclude nor/baseband upgrade (legacy devices)\n" \
 	"  -t, --shsh            Fetch TSS record and save to .shsh file, then exit\n" \
 	"  -z, --no-restore      Do not restore and end after booting to the ramdisk\n" \
 	"  -k, --keep-pers       Write personalized components to files for debugging\n" \
@@ -296,6 +293,9 @@ static void irecv_event_cb(const irecv_device_event_t* event, void *userdata)
 				case IRECV_K_DFU_MODE:
 					client->mode = MODE_DFU;
 					break;
+				case IRECV_K_PORT_DFU_MODE:
+					client->mode = MODE_PORTDFU;
+					break;
 				case IRECV_K_RECOVERY_MODE_1:
 				case IRECV_K_RECOVERY_MODE_2:
 				case IRECV_K_RECOVERY_MODE_3:
@@ -314,11 +314,19 @@ static void irecv_event_cb(const irecv_device_event_t* event, void *userdata)
 			mutex_lock(&client->device_event_mutex);
 			client->mode = MODE_UNKNOWN;
 			debug("%s: device %016" PRIx64 " (udid: %s) disconnected\n", __func__, client->ecid, (client->udid) ? client->udid : "N/A");
+			if (event->mode == IRECV_K_PORT_DFU_MODE) {
+				// We have to reset the ECID here if a port DFU device disconnects,
+				// because when the device reconnects in a different mode, it will
+				// have the actual device ECID and wouldn't get detected.
+				client->ecid = 0;
+			}
 			cond_signal(&client->device_event_cond);
 			mutex_unlock(&client->device_event_mutex);
 		}
 	}
 }
+
+int build_identity_check_components_in_ipsw(plist_t build_identity, ipsw_archive_t ipsw);
 
 int idevicerestore_start(struct idevicerestore_client_t* client)
 {
@@ -339,10 +347,15 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		return -1;
 	}
 
-	if (client->flags & FLAG_DEBUG) {
-		idevice_set_debug_level(1);
-		irecv_set_debug_level(1);
+	if (client->debug_level > 0) {
 		idevicerestore_debug = 1;
+		if (client->debug_level > 1) {
+			irecv_set_debug_level(1);
+		}
+		if (client->debug_level > 2) {
+			idevice_set_debug_level(1);
+		}
+		tss_set_debug_level(client->debug_level);
 	}
 
 	idevicerestore_progress(client, RESTORE_STEP_DETECT, 0.0);
@@ -380,7 +393,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		}
 
 		char wtfname[256];
-		sprintf(wtfname, "Firmware/dfu/WTF.s5l%04xxall.RELEASE.dfu", cpid);
+		snprintf(wtfname, sizeof(wtfname), "Firmware/dfu/WTF.s5l%04xxall.RELEASE.dfu", cpid);
 		unsigned char* wtftmp = NULL;
 		unsigned int wtfsize = 0;
 
@@ -424,7 +437,9 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 				download_to_file(s_wtfurl, wtfipsw, 0);
 			}
 
-			ipsw_extract_to_memory(wtfipsw, wtfname, &wtftmp, &wtfsize);
+			ipsw_archive_t wtf_ipsw = ipsw_open(wtfipsw);
+			ipsw_extract_to_memory(wtf_ipsw, wtfname, &wtftmp, &wtfsize);
+			ipsw_close(wtf_ipsw);
 			if (!wtftmp) {
 				error("ERROR: Could not extract WTF\n");
 			}
@@ -470,6 +485,21 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		return -1;
 	}
 
+	if (client->mode == MODE_NORMAL) {
+		plist_t pver = normal_get_lockdown_value(client, NULL, "ProductVersion");
+		if (pver) {
+			plist_get_string_val(pver, &client->device_version);
+			plist_free(pver);
+		}
+		pver = normal_get_lockdown_value(client, NULL, "BuildVersion");
+		if (pver) {
+			plist_get_string_val(pver, &client->device_build);
+			plist_free(pver);
+		}
+	}
+	info("Device Product Version: %s\n", (client->device_version) ? client->device_version : "N/A");
+	info("Device Product Build: %s\n", (client->device_build) ? client->device_build : "N/A");
+
 	if (client->flags & FLAG_PWN) {
 		recovery_client_free(client);
 
@@ -482,17 +512,24 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		if (dfu_client_new(client) < 0) {
 			return -1;
 		}
-		info("exploiting with limera1n...\n");
-		// TODO: check for non-limera1n device and fail
-		if (limera1n_exploit(client->device, &client->dfu->client) != 0) {
-			error("ERROR: limera1n exploit failed\n");
+
+		if (limera1n_is_supported(client->device)) {
+			info("exploiting with limera1n...\n");
+			if (limera1n_exploit(client->device, &client->dfu->client) != 0) {
+				error("ERROR: limera1n exploit failed\n");
+				dfu_client_free(client);
+				return -1;
+			}
 			dfu_client_free(client);
+			info("Device should be in pwned DFU state now.\n");
+
+			return 0;
+		}
+		else {
+			dfu_client_free(client);
+			error("ERROR: This device is not supported by the limera1n exploit");
 			return -1;
 		}
-		dfu_client_free(client);
-		info("Device should be in pwned DFU state now.\n");
-
-		return 0;
 	}
 
 	if (client->flags & FLAG_LATEST) {
@@ -594,12 +631,16 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		char* ipsw = NULL;
 		res = ipsw_download_fw(fwurl, p_fwsha1, client->cache_dir, &ipsw);
 		if (res != 0) {
-			if (ipsw) {
-				free(ipsw);
-			}
+			free(ipsw);
 			return res;
 		} else {
-			client->ipsw = ipsw;
+			client->ipsw = ipsw_open(ipsw);
+			if (!client->ipsw) {
+				error("ERROR: Failed to open ipsw '%s'\n", ipsw);
+				free(ipsw);
+				return -1;
+			}
+			free(ipsw);
 		}
 	}
 	idevicerestore_progress(client, RESTORE_STEP_DETECT, 0.6);
@@ -608,14 +649,29 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		return 0;
 	}
 
+	// extract buildmanifest
+	if (client->flags & FLAG_CUSTOM) {
+		info("Extracting Restore.plist from IPSW\n");
+		if (ipsw_extract_restore_plist(client->ipsw, &client->build_manifest) < 0) {
+			error("ERROR: Unable to extract Restore.plist from %s. Firmware file might be corrupt.\n", client->ipsw->path);
+			return -1;
+		}
+	} else {
+		info("Extracting BuildManifest from IPSW\n");
+		if (ipsw_extract_build_manifest(client->ipsw, &client->build_manifest, &tss_enabled) < 0) {
+			error("ERROR: Unable to extract BuildManifest from %s. Firmware file might be corrupt.\n", client->ipsw->path);
+			return -1;
+		}
+	}
+
+	if (client->flags & FLAG_CUSTOM) {
+		// prevent attempt to sign custom firmware
+		tss_enabled = 0;
+		info("Custom firmware requested; TSS has been disabled.\n");
+	}
+
 	if (client->mode == MODE_RESTORE) {
-		if (client->flags & FLAG_ALLOW_RESTORE_MODE) {
-			tss_enabled = 0;
-			if (!client->root_ticket) {
-				client->root_ticket = (void*)strdup("");
-				client->root_ticket_len = 0;
-			}
-		} else {
+		if (!(client->flags & FLAG_ALLOW_RESTORE_MODE)) {
 			if (restore_reboot(client) < 0) {
 				error("ERROR: Unable to exit restore mode\n");
 				return -2;
@@ -634,26 +690,153 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		}
 	}
 
-	// verify if ipsw file exists
-	if (access(client->ipsw, F_OK) < 0) {
-		error("ERROR: Firmware file %s does not exist.\n", client->ipsw);
-		return -1;
+	if (client->mode == MODE_PORTDFU) {
+		unsigned int pdfu_bdid = 0;
+		unsigned int pdfu_cpid = 0;
+		unsigned int prev = 0;
+
+		if (dfu_get_bdid(client, &pdfu_bdid) < 0) {
+			error("ERROR: Failed to get bdid for Port DFU device!\n");
+			return -1;
+		}
+		if (dfu_get_cpid(client, &pdfu_cpid) < 0) {
+			error("ERROR: Failed to get cpid for Port DFU device!\n");
+			return -1;
+		}
+		if (dfu_get_prev(client, &prev) < 0) {
+			error("ERROR: Failed to get PREV for Port DFU device!\n");
+			return -1;
+		}
+
+		unsigned char* pdfu_nonce = NULL;
+		unsigned int pdfu_nsize = 0;
+		if (dfu_get_portdfu_nonce(client, &pdfu_nonce, &pdfu_nsize) < 0) {
+			error("ERROR: Failed to get nonce for Port DFU device!\n");
+			return -1;
+		}
+
+		plist_t build_identity = build_manifest_get_build_identity_for_model_with_variant(client->build_manifest, client->device->hardware_model, RESTORE_VARIANT_ERASE_INSTALL, 0);
+		if (!build_identity) {
+			error("ERORR: Failed to get build identity\n");
+			return -1;
+		}
+
+		unsigned int b_pdfu_cpid = (unsigned int)plist_dict_get_uint(build_identity, "USBPortController1,ChipID");
+		if (b_pdfu_cpid != pdfu_cpid) {
+			error("ERROR: cpid 0x%02x doesn't match USBPortController1,ChipID in build identity (0x%02x)\n", pdfu_cpid, b_pdfu_cpid);
+			return -1;
+		}
+		unsigned int b_pdfu_bdid = (unsigned int)plist_dict_get_uint(build_identity, "USBPortController1,BoardID");
+		if (b_pdfu_bdid != pdfu_bdid) {
+			error("ERROR: bdid 0x%x doesn't match USBPortController1,BoardID in build identity (0x%x)\n", pdfu_bdid, b_pdfu_bdid);
+			return -1;
+		}
+
+		plist_t parameters = plist_new_dict();
+		plist_dict_set_item(parameters, "@USBPortController1,Ticket", plist_new_bool(1));
+		plist_dict_set_item(parameters, "USBPortController1,ECID", plist_new_int(client->ecid));
+		plist_dict_copy_item(parameters, build_identity, "USBPortController1,BoardID", NULL);
+		plist_dict_copy_item(parameters, build_identity, "USBPortController1,ChipID", NULL);
+		plist_dict_copy_item(parameters, build_identity, "USBPortController1,SecurityDomain", NULL);
+		plist_dict_set_item(parameters, "USBPortController1,SecurityMode", plist_new_bool(1));
+		plist_dict_set_item(parameters, "USBPortController1,ProductionMode", plist_new_bool(1));
+		plist_t usbf = plist_access_path(build_identity, 2, "Manifest", "USBPortController1,USBFirmware");
+		if (!usbf) {
+			plist_free(parameters);
+			error("ERROR: Unable to find USBPortController1,USBFirmware in build identity\n");
+			return -1;
+		}
+		plist_t p_fwpath = plist_access_path(usbf, 2, "Info", "Path");
+		if (!p_fwpath) {
+			plist_free(parameters);
+			error("ERROR: Unable to find path of USBPortController1,USBFirmware component\n");
+			return -1;
+		}
+		const char* fwpath = plist_get_string_ptr(p_fwpath, NULL);
+		if (!fwpath) {
+			plist_free(parameters);
+			error("ERROR: Unable to get path of USBPortController1,USBFirmware component\n");
+			return -1;
+		}
+		unsigned char* uarp_buf = NULL;
+		unsigned int uarp_size = 0;
+		if (ipsw_extract_to_memory(client->ipsw, fwpath, &uarp_buf, &uarp_size) < 0) {
+			plist_free(parameters);
+			error("ERROR: Unable to extract '%s' from IPSW\n", fwpath);
+			return -1;
+		}
+		usbf = plist_copy(usbf);
+		plist_dict_remove_item(usbf, "Info");
+		plist_dict_set_item(parameters, "USBPortController1,USBFirmware", usbf);
+		plist_dict_set_item(parameters, "USBPortController1,Nonce", plist_new_data((const char*)pdfu_nonce, pdfu_nsize));
+
+		plist_t request = tss_request_new(NULL);
+		if (request == NULL) {
+			plist_free(parameters);
+			error("ERROR: Unable to create TSS request\n");
+			return -1;
+		}
+		plist_dict_merge(&request, parameters);
+		plist_free(parameters);
+
+		// send request and grab response
+		plist_t response = tss_request_send(request, client->tss_url);
+		plist_free(request);
+		if (response == NULL) {
+			error("ERROR: Unable to send TSS request\n");
+			return -1;
+		}
+		info("Received USBPortController1,Ticket\n");
+
+		info("Creating Ace3Binary\n");
+		unsigned char* ace3bin = NULL;
+		size_t ace3bin_size = 0;
+		if (ace3_create_binary(uarp_buf, uarp_size, pdfu_bdid, prev, response, &ace3bin, &ace3bin_size) < 0) {
+			error("ERROR: Could not create Ace3Binary\n");
+			return -1;
+		}
+		plist_free(response);
+		free(uarp_buf);
+
+		if (idevicerestore_keep_pers) {
+			write_file("Ace3Binary", (const char*)ace3bin, ace3bin_size);
+		}
+
+		if (dfu_send_buffer_with_options(client, ace3bin, ace3bin_size, IRECV_SEND_OPT_DFU_NOTIFY_FINISH | IRECV_SEND_OPT_DFU_SMALL_PKT) < 0) {
+			error("ERROR: Could not send Ace3Buffer to device\n");
+			return -1;
+		}
+
+		debug("Waiting for device to disconnect...\n");
+		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 5000);
+		if (client->mode != MODE_UNKNOWN || (client->flags & FLAG_QUIT)) {
+			mutex_unlock(&client->device_event_mutex);
+
+			if (!(client->flags & FLAG_QUIT)) {
+				error("ERROR: Device did not disconnect. Port DFU failed.\n");
+			}
+			return -2;
+		}
+		dfu_client_free(client);
+		debug("Waiting for device to reconnect in DFU mode...\n");
+		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 20000);
+		if (client->mode != MODE_DFU || (client->flags & FLAG_QUIT)) {
+			mutex_unlock(&client->device_event_mutex);
+			if (!(client->flags & FLAG_QUIT)) {
+				error("ERROR: Device did not reconnect in DFU mode. Port DFU failed.\n");
+			}
+			return -2;
+		}
+		mutex_unlock(&client->device_event_mutex);
+
+		if (client->flags & FLAG_NOACTION) {
+			info("Port DFU restore successful.\n");
+			return 0;
+		} else {
+			info("Port DFU restore successful. Continuing.\n");
+		}
 	}
 
-	// extract buildmanifest
-	if (client->flags & FLAG_CUSTOM) {
-		info("Extracting Restore.plist from IPSW\n");
-		if (ipsw_extract_restore_plist(client->ipsw, &client->build_manifest) < 0) {
-			error("ERROR: Unable to extract Restore.plist from %s. Firmware file might be corrupt.\n", client->ipsw);
-			return -1;
-		}
-	} else {
-		info("Extracting BuildManifest from IPSW\n");
-		if (ipsw_extract_build_manifest(client->ipsw, &client->build_manifest, &tss_enabled) < 0) {
-			error("ERROR: Unable to extract BuildManifest from %s. Firmware file might be corrupt.\n", client->ipsw);
-			return -1;
-		}
-	}
 	idevicerestore_progress(client, RESTORE_STEP_DETECT, 0.8);
 
 	/* check if device type is supported by the given build manifest */
@@ -665,17 +848,11 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 	/* print iOS information from the manifest */
 	build_manifest_get_version_information(client->build_manifest, client);
 
-	info("Product Version: %s\n", client->version);
-	info("Product Build: %s Major: %d\n", client->build, client->build_major);
+	info("IPSW Product Version: %s\n", client->version);
+	info("IPSW Product Build: %s Major: %d\n", client->build, client->build_major);
 
 	client->image4supported = is_image4_supported(client);
 	info("Device supports Image4: %s\n", (client->image4supported) ? "true" : "false");
-
-	if (client->flags & FLAG_CUSTOM) {
-		/* prevent signing custom firmware */
-		tss_enabled = 0;
-		info("Custom firmware requested. Disabled TSS request.\n");
-	}
 
 	// choose whether this is an upgrade or a restore (default to upgrade)
 	client->tss = NULL;
@@ -700,7 +877,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 				x++;
 			}
 
-			sprintf(p_all_flash, "Firmware/all_flash/all_flash.%s.%s", lcmodel, "production");
+			snprintf(p_all_flash, sizeof(p_all_flash), "Firmware/all_flash/all_flash.%s.%s", lcmodel, "production");
 			strcpy(tmpstr, p_all_flash);
 			strcat(tmpstr, "/manifest");
 
@@ -750,7 +927,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 			}
 
 			// add iBSS
-			sprintf(tmpstr, "Firmware/dfu/iBSS.%s.%s.dfu", lcmodel, "RELEASE");
+			snprintf(tmpstr, sizeof(tmpstr), "Firmware/dfu/iBSS.%s.%s.dfu", lcmodel, "RELEASE");
 			inf = plist_new_dict();
 			plist_dict_set_item(inf, "Path", plist_new_string(tmpstr));
 			comp = plist_new_dict();
@@ -758,7 +935,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 			plist_dict_set_item(manifest, "iBSS", comp);
 
 			// add iBEC
-			sprintf(tmpstr, "Firmware/dfu/iBEC.%s.%s.dfu", lcmodel, "RELEASE");
+			snprintf(tmpstr, sizeof(tmpstr), "Firmware/dfu/iBEC.%s.%s.dfu", lcmodel, "RELEASE");
 			inf = plist_new_dict();
 			plist_dict_set_item(inf, "Path", plist_new_string(tmpstr));
 			comp = plist_new_dict();
@@ -859,17 +1036,11 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 	}
 
 	if (client->mode == MODE_NORMAL && !(client->flags & FLAG_ERASE) && !(client->flags & FLAG_SHSHONLY)) {
-		plist_t pver = normal_get_lockdown_value(client, NULL, "ProductVersion");
-		char *device_version = NULL;
-		if (pver) {
-			plist_get_string_val(pver, &device_version);
-			plist_free(pver);
-		}
-		if (device_version && (compare_versions(device_version, client->version) > 0)) {
+		if (client->device_version && (compare_versions(client->device_version, client->version) > 0)) {
 			if (client->flags & FLAG_INTERACTIVE) {
 				char input[64];
 				char spaces[16];
-				int num_spaces = 13 - strlen(client->version) - strlen(device_version);
+				int num_spaces = 13 - strlen(client->version) - strlen(client->device_version);
 				memset(spaces, ' ', num_spaces);
 				spaces[num_spaces] = '\0';
 				printf("################################ [ WARNING ] #################################\n"
@@ -880,7 +1051,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 				       "# If you want to take the risk (and have a backup of your important data!)   #\n"
 				       "# type YES and press ENTER to continue. You have been warned.                #\n"
 				       "##############################################################################\n",
-				       device_version, client->version, spaces);
+				       client->device_version, client->version, spaces);
 				while (1) {
 					printf("> ");
 					fflush(stdout);
@@ -899,7 +1070,6 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 				}
 			}
 		}
-		free(device_version);
 	}
 
 	if (client->flags & FLAG_ERASE && client->flags & FLAG_INTERACTIVE) {
@@ -934,112 +1104,74 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 	/* check if all components we need are actually there */
 	info("Checking IPSW for required components...\n");
 	if (build_identity_check_components_in_ipsw(build_identity, client->ipsw) < 0) {
-		error("ERROR: Could not find all required components in IPSW %s\n", client->ipsw);
+		error("ERROR: Could not find all required components in IPSW %s\n", client->ipsw->path);
 		return -1;
 	}
 	info("All required components found in IPSW\n");
 
-	// Get filesystem name from build identity
-	char* fsname = NULL;
-	if (build_identity_get_component_path(build_identity, "OS", &fsname) < 0) {
+	/* Get OS (filesystem) name from build identity */
+	char* os_path = NULL;
+	if (build_identity_get_component_path(build_identity, "OS", &os_path) < 0) {
 		error("ERROR: Unable to get path for filesystem component\n");
 		return -1;
 	}
 
-	// check if we already have an extracted filesystem
-	int delete_fs = 0;
-	char* filesystem = NULL;
-	struct stat st;
-	memset(&st, '\0', sizeof(struct stat));
-	char tmpf[1024];
-	if (client->cache_dir) {
-		if (stat(client->cache_dir, &st) < 0) {
-			mkdir_with_parents(client->cache_dir, 0755);
+	/* check if IPSW has OS component 'stored' in ZIP archive, otherwise we need to extract it */
+	int needs_os_extraction = 0;
+	if (client->ipsw->zip) {
+		ipsw_file_handle_t zfile = ipsw_file_open(client->ipsw, os_path);
+		if (zfile) {
+			if (!zfile->seekable) {
+				needs_os_extraction = 1;
+			}
+			ipsw_file_close(zfile);
 		}
-		strcpy(tmpf, client->cache_dir);
-		strcat(tmpf, "/");
-		char *ipswtmp = strdup(client->ipsw);
-		strcat(tmpf, basename(ipswtmp));
-		free(ipswtmp);
-	} else {
-		strcpy(tmpf, client->ipsw);
 	}
 
-	if (!ipsw_is_directory(client->ipsw)) {
-		// strip off file extension if given ipsw is not a directory
-		char* s = tmpf + strlen(tmpf) - 1;
-		char* p = s;
-		while (*p != '\0' && *p != '.' && *p != '/' && *p != '\\') p--;
-		if (s - p < 6) {
-			if (*p == '.') {
+	if (needs_os_extraction && !(client->flags & FLAG_SHSHONLY)) {
+		char* tmpf = NULL;
+		struct stat st;
+		if (client->cache_dir) {
+			memset(&st, '\0', sizeof(struct stat));
+			if (stat(client->cache_dir, &st) < 0) {
+				mkdir_with_parents(client->cache_dir, 0755);
+			}
+			char* ipsw_basename = strdup(path_get_basename(client->ipsw->path));
+			char* p = strrchr(ipsw_basename, '.');
+			if (p && isalpha(*(p+1))) {
 				*p = '\0';
 			}
-		}
-	}
-
-	if (stat(tmpf, &st) < 0) {
-		__mkdir(tmpf, 0755);
-	}
-	strcat(tmpf, "/");
-	strcat(tmpf, fsname);
-
-	memset(&st, '\0', sizeof(struct stat));
-	if (stat(tmpf, &st) == 0) {
-		uint64_t fssize = 0;
-		ipsw_get_file_size(client->ipsw, fsname, &fssize);
-		if ((fssize > 0) && ((uint64_t)st.st_size == fssize)) {
-			info("Using cached filesystem from '%s'\n", tmpf);
-			filesystem = strdup(tmpf);
-		}
-	}
-
-	if (!filesystem && !(client->flags & FLAG_SHSHONLY)) {
-		char extfn[1024];
-		strcpy(extfn, tmpf);
-		strcat(extfn, ".extract");
-		char lockfn[1024];
-		strcpy(lockfn, tmpf);
-		strcat(lockfn, ".lock");
-		lock_info_t li;
-
-		lock_file(lockfn, &li);
-		FILE* extf = NULL;
-		if (access(extfn, F_OK) != 0) {
-			extf = fopen(extfn, "wb");
-		}
-		unlock_file(&li);
-		if (!extf) {
-			// use temp filename
-			filesystem = get_temp_filename("ipsw_");
-			if (!filesystem) {
-				error("WARNING: Could not get temporary filename, using '%s' in current directory\n", fsname);
-				filesystem = strdup(fsname);
-			}
-			delete_fs = 1;
+			tmpf = string_build_path(client->cache_dir, ipsw_basename, NULL);
+			mkdir_with_parents(tmpf, 0755);
+			free(tmpf);
+			tmpf = string_build_path(client->cache_dir, ipsw_basename, os_path, NULL);
+			free(ipsw_basename);
 		} else {
-			// use <fsname>.extract as filename
-			filesystem = strdup(extfn);
-			fclose(extf);
-		}
-		remove(lockfn);
-
-		// Extract filesystem from IPSW
-		info("Extracting filesystem from IPSW: %s\n", fsname);
-		if (ipsw_extract_to_file_with_progress(client->ipsw, fsname, filesystem, 1) < 0) {
-			error("ERROR: Unable to extract filesystem from IPSW\n");
-			if (client->tss)
-				plist_free(client->tss);
-			info("Removing %s\n", filesystem);
-			unlink(filesystem);
-			return -1;
+			tmpf = get_temp_filename(NULL);
+			client->delete_fs = 1;
 		}
 
-		if (strstr(filesystem, ".extract")) {
-			// rename <fsname>.extract to <fsname>
-			remove(tmpf);
-			rename(filesystem, tmpf);
-			free(filesystem);
-			filesystem = strdup(tmpf);
+		/* check if we already have it extracted */
+		uint64_t fssize = 0;
+		ipsw_get_file_size(client->ipsw, os_path, &fssize);
+		memset(&st, '\0', sizeof(struct stat));
+		if (stat(tmpf, &st) == 0) {
+			if ((fssize > 0) && ((uint64_t)st.st_size == fssize)) {
+				info("Using cached filesystem from '%s'\n", tmpf);
+				client->filesystem = tmpf;
+			}
+		}
+
+		if (!client->filesystem) {
+			info("Extracting filesystem from IPSW: %s\n", os_path);
+			if (ipsw_extract_to_file_with_progress(client->ipsw, os_path, tmpf, 1) < 0) {
+				error("ERROR: Unable to extract filesystem from IPSW\n");
+				info("Removing %s\n", tmpf);
+				unlink(tmpf);
+				free(tmpf);
+				return -1;
+			}
+			client->filesystem = tmpf;
 		}
 	}
 
@@ -1080,7 +1212,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 
 		if (client->build_major > 8) {
 			unsigned char* nonce = NULL;
-			int nonce_size = 0;
+			unsigned int nonce_size = 0;
 			if (get_ap_nonce(client, &nonce, &nonce_size) < 0) {
 				/* the first nonce request with older firmware releases can fail and it's OK */
 				info("NOTE: Unable to get nonce from device\n");
@@ -1095,25 +1227,75 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 			} else {
 				free(nonce);
 			}
+			if (client->mode == MODE_NORMAL) {
+				plist_t ap_params = normal_get_lockdown_value(client, NULL, "ApParameters");
+				if (ap_params) {
+					if (!client->parameters) {
+						client->parameters = plist_new_dict();
+					}
+					plist_dict_merge(&client->parameters, ap_params);
+					plist_t p_sep_nonce = plist_dict_get_item(ap_params, "SepNonce");
+					uint64_t sep_nonce_size = 0;
+					const char* sep_nonce = plist_get_data_ptr(p_sep_nonce, &sep_nonce_size);
+					info("Getting SepNonce in normal mode... ");
+					int i = 0;
+					for (i = 0; i < sep_nonce_size; i++) {
+						info("%02x ", (unsigned char)sep_nonce[i]);
+					}
+					info("\n");
+					plist_free(ap_params);
+				}
+				plist_t req_nonce_slot = plist_access_path(build_identity, 2, "Info", "RequiresNonceSlot");
+				if (req_nonce_slot) {
+					plist_dict_set_item(client->parameters, "RequiresNonceSlot", plist_copy(req_nonce_slot));
+				}
+			}
 		}
 
 		if (client->flags & FLAG_QUIT) {
 			return -1;
 		}
 		
-		if (get_tss_response(client, build_identity, &client->tss) < 0) {
-			error("ERROR: Unable to get SHSH blobs for this device\n");
-			return -1;
-		}
-		if (client->macos_variant) {
-			if (get_local_policy_tss_response(client, build_identity, &client->tss_localpolicy) < 0) {
-				error("ERROR: Unable to get SHSH blobs for this device (local policy)\n");
+		if (client->mode == MODE_RESTORE && client->root_ticket) {
+			plist_t ap_ticket = plist_new_data((char*)client->root_ticket, client->root_ticket_len);
+			if (!ap_ticket) {
+				error("ERROR: Failed to create ApImg4Ticket node value.\n");
 				return -1;
 			}
-			if (get_recoveryos_root_ticket_tss_response(client, build_identity, &client->tss_recoveryos_root_ticket) <
-				0) {
-				error("ERROR: Unable to get SHSH blobs for this device (recovery OS Root Ticket)\n");
+			client->tss = plist_new_dict();
+			if (!client->tss) {
+				error("ERROR: Failed to create ApImg4Ticket node.\n");
 				return -1;
+			}
+			plist_dict_set_item(client->tss, "ApImg4Ticket", ap_ticket);
+		} else {
+			if (get_tss_response(client, build_identity, &client->tss) < 0) {
+				error("ERROR: Unable to get SHSH blobs for this device\n");
+				return -1;
+			}
+			if (client->macos_variant) {
+				if (get_local_policy_tss_response(client, build_identity, &client->tss_localpolicy) < 0) {
+					error("ERROR: Unable to get SHSH blobs for this device (local policy)\n");
+					return -1;
+				}
+				if (get_recoveryos_root_ticket_tss_response(client, build_identity, &client->tss_recoveryos_root_ticket) < 0) {
+					error("ERROR: Unable to get SHSH blobs for this device (recovery OS Root Ticket)\n");
+					return -1;
+				}
+			} else {
+				plist_t recovery_variant = plist_access_path(build_identity, 2, "Info", "RecoveryVariant");
+				if (recovery_variant) {
+					const char* recovery_variant_str = plist_get_string_ptr(recovery_variant, NULL);
+					client->recovery_variant = build_manifest_get_build_identity_for_model_with_variant(client->build_manifest, client->device->hardware_model, recovery_variant_str, 1);
+					if (!client->recovery_variant) {
+						error("ERROR: Variant '%s' not found in BuildManifest\n", recovery_variant_str);
+						return -1;
+					}
+					if (get_tss_response(client, client->recovery_variant, &client->tss_recoveryos_root_ticket) < 0) {
+						error("ERROR: Unable to get SHSH blobs for this device (%s)\n", recovery_variant_str);
+						return -1;
+					}
+				}
 			}
 		}
 
@@ -1133,8 +1315,6 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 	}
 
 	if (client->flags & FLAG_QUIT) {
-		if (delete_fs && filesystem)
-			unlink(filesystem);
 		return -1;
 	}
 	if (client->flags & FLAG_SHSHONLY) {
@@ -1158,7 +1338,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 					strcpy(zfn, "shsh");
 				}
 				mkdir_with_parents(zfn, 0755);
-				sprintf(zfn+strlen(zfn), "/%" PRIu64 "-%s-%s.shsh", client->ecid, client->device->product_type, client->version);
+				snprintf(&zfn[0]+strlen(zfn), sizeof(zfn)-strlen(zfn), "/%" PRIu64 "-%s-%s.shsh", client->ecid, client->device->product_type, client->version);
 				struct stat fst;
 				if (stat(zfn, &fst) != 0) {
 					gzFile zf = gzopen(zfn, "wb");
@@ -1189,8 +1369,6 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 	}
 	idevicerestore_progress(client, RESTORE_STEP_PREPARE, 0.25);
 	if (client->flags & FLAG_QUIT) {
-		if (delete_fs && filesystem)
-			unlink(filesystem);
 		return -1;
 	}
 
@@ -1207,8 +1385,6 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 
 	idevicerestore_progress(client, RESTORE_STEP_PREPARE, 0.3);
 	if (client->flags & FLAG_QUIT) {
-		if (delete_fs && filesystem)
-			unlink(filesystem);
 		return -1;
 	}
 
@@ -1219,17 +1395,12 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		if ((client->flags & FLAG_CUSTOM) && limera1n_is_supported(client->device)) {
 			info("connecting to DFU\n");
 			if (dfu_client_new(client) < 0) {
-				if (delete_fs && filesystem)
-					unlink(filesystem);
 				return -1;
 			}
 			info("exploiting with limera1n\n");
-			// TODO: check for non-limera1n device and fail
 			if (limera1n_exploit(client->device, &client->dfu->client) != 0) {
 				error("ERROR: limera1n exploit failed\n");
 				dfu_client_free(client);
-				if (delete_fs && filesystem)
-					unlink(filesystem);
 				return -1;
 			}
 			dfu_client_free(client);
@@ -1239,8 +1410,6 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 			error("ERROR: Unable to place device into recovery mode from DFU mode\n");
 			if (client->tss)
 				plist_free(client->tss);
-			if (delete_fs && filesystem)
-				unlink(filesystem);
 			return -2;
 		}
 	} else if (client->mode == MODE_RECOVERY) {
@@ -1250,8 +1419,6 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 				/* send ApTicket */
 				if (recovery_send_ticket(client) < 0) {
 					error("ERROR: Unable to send APTicket\n");
-					if (delete_fs && filesystem)
-						unlink(filesystem);
 					return -2;
 				}
 			}
@@ -1263,8 +1430,6 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		if (recovery_send_ibec(client, build_identity) < 0) {
 			mutex_unlock(&client->device_event_mutex);
 			error("ERROR: Unable to send iBEC\n");
-			if (delete_fs && filesystem)
-				unlink(filesystem);
 			return -2;
 		}
 		recovery_client_free(client);
@@ -1277,10 +1442,9 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 			if (!(client->flags & FLAG_QUIT)) {
 				error("ERROR: Device did not disconnect. Possibly invalid iBEC. Reset device and try again.\n");
 			}
-			if (delete_fs && filesystem)
-				unlink(filesystem);
 			return -2;
 		}
+		recovery_client_free(client);
 		debug("Waiting for device to reconnect in recovery mode...\n");
 		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 60000);
 		if (client->mode != MODE_RECOVERY || (client->flags & FLAG_QUIT)) {
@@ -1288,29 +1452,23 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 			if (!(client->flags & FLAG_QUIT)) {
 				error("ERROR: Device did not reconnect in recovery mode. Possibly invalid iBEC. Reset device and try again.\n");
 			}
-			if (delete_fs && filesystem)
-				unlink(filesystem);
 			return -2;
 		}
 		mutex_unlock(&client->device_event_mutex);
 	}
 	idevicerestore_progress(client, RESTORE_STEP_PREPARE, 0.5);
 	if (client->flags & FLAG_QUIT) {
-		if (delete_fs && filesystem)
-			unlink(filesystem);
 		return -1;
 	}
 
 	if (!client->image4supported && (client->build_major > 8)) {
 		// we need another tss request with nonce.
 		unsigned char* nonce = NULL;
-		int nonce_size = 0;
+		unsigned int nonce_size = 0;
 		int nonce_changed = 0;
 		if (get_ap_nonce(client, &nonce, &nonce_size) < 0) {
 			error("ERROR: Unable to get nonce from device!\n");
 			recovery_send_reset(client);
-			if (delete_fs && filesystem)
-				unlink(filesystem);
 			return -2;
 		}
 
@@ -1330,14 +1488,10 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 			plist_free(client->tss);
 			if (get_tss_response(client, build_identity, &client->tss) < 0) {
 				error("ERROR: Unable to get SHSH blobs for this device\n");
-				if (delete_fs && filesystem)
-					unlink(filesystem);
 				return -1;
 			}
 			if (!client->tss) {
 				error("ERROR: can't continue without TSS\n");
-				if (delete_fs && filesystem)
-					unlink(filesystem);
 				return -1;
 			}
 			fixup_tss(client->tss);
@@ -1345,8 +1499,6 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 	}
 	idevicerestore_progress(client, RESTORE_STEP_PREPARE, 0.7);
 	if (client->flags & FLAG_QUIT) {
-		if (delete_fs && filesystem)
-			unlink(filesystem);
 		return -1;
 	}
 
@@ -1356,8 +1508,6 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 			error("ERROR: Unable to place device into restore mode\n");
 			if (client->tss)
 				plist_free(client->tss);
-			if (delete_fs && filesystem)
-				unlink(filesystem);
 			return -2;
 		}
 		recovery_client_free(client);
@@ -1371,9 +1521,11 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		if (client->mode != MODE_RESTORE || (client->flags & FLAG_QUIT)) {
 			mutex_unlock(&client->device_event_mutex);
 			error("ERROR: Device failed to enter restore mode.\n");
-			error("Please make sure that usbmuxd is running.\n");
-			if (delete_fs && filesystem)
-				unlink(filesystem);
+			if (client->mode == MODE_UNKNOWN) {
+				error("Make sure that usbmuxd is running.\n");
+			} else if (client->mode == MODE_RECOVERY) {
+				error("Device reconnected in recovery mode, most likely image personalization failed.\n");
+			}
 			return -1;
 		}
 		mutex_unlock(&client->device_event_mutex);
@@ -1382,23 +1534,17 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 	// device is finally in restore mode, let's do this
 	if (client->mode == MODE_RESTORE) {
 		if ((client->flags & FLAG_NO_RESTORE) != 0) {
-			info("Device is now in restore mode. Exiting as requested.");
+			info("Device is now in restore mode. Exiting as requested.\n");
 			return 0;
 		}
 		client->ignore_device_add_events = 1;
 		info("About to restore device... \n");
-		result = restore_device(client, build_identity, filesystem);
+		result = restore_device(client, build_identity);
 		if (result < 0) {
 			error("ERROR: Unable to restore device\n");
-			if (delete_fs && filesystem)
-				unlink(filesystem);
 			return result;
 		}
 	}
-
-	info("Cleaning up...\n");
-	if (delete_fs && filesystem)
-		unlink(filesystem);
 
 	/* special handling of older AppleTVs as they enter Recovery mode on boot when plugged in to USB */
 	if ((strncmp(client->device->product_type, "AppleTV", 7) == 0) && (client->device->product_type[7] < '5')) {
@@ -1413,10 +1559,11 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		}
 	}
 
-	info("DONE\n");
-
 	if (result == 0) {
+		info("DONE\n");
 		idevicerestore_progress(client, RESTORE_NUM_STEPS-1, 1.0);
+	} else {
+		info("RESTORE FAILED\n");
 	}
 
 	if (build_identity_needs_free)
@@ -1470,14 +1617,18 @@ void idevicerestore_client_free(struct idevicerestore_client_t* client)
 		free(client->srnm);
 	}
 	if (client->ipsw) {
-		free(client->ipsw);
+		ipsw_close(client->ipsw);
 	}
-	if (client->version) {
-		free(client->version);
+	if (client->filesystem) {
+		if (client->delete_fs) {
+			unlink(client->filesystem);
+		}
+		free(client->filesystem);
 	}
-	if (client->build) {
-		free(client->build);
-	}
+	free(client->version);
+	free(client->build);
+	free(client->device_version);
+	free(client->device_build);
 	if (client->restore_boot_args) {
 		free(client->restore_boot_args);
 	}
@@ -1489,6 +1640,9 @@ void idevicerestore_client_free(struct idevicerestore_client_t* client)
 	}
 	if (client->build_manifest) {
 		plist_free(client->build_manifest);
+	}
+	if (client->firmware_preflight_info) {
+		plist_free(client->firmware_preflight_info);
 	}
 	if (client->preflight_info) {
 		plist_free(client->preflight_info);
@@ -1529,11 +1683,11 @@ void idevicerestore_set_ipsw(struct idevicerestore_client_t* client, const char*
 	if (!client)
 		return;
 	if (client->ipsw) {
-		free(client->ipsw);
+		ipsw_close(client->ipsw);
 		client->ipsw = NULL;
 	}
 	if (path) {
-		client->ipsw = strdup(path);
+		client->ipsw = ipsw_open(path);
 	}
 }
 
@@ -1611,7 +1765,7 @@ int main(int argc, char* argv[]) {
 		client->flags |= FLAG_INTERACTIVE;
 	}
 
-	while ((opt = getopt_long(argc, argv, "dhcesxtpli:u:nC:kyPRT:zv", longopts, &optindex)) > 0) {
+	while ((opt = getopt_long(argc, argv, "dhces:xtpli:u:nC:kyPRT:zv", longopts, &optindex)) > 0) {
 		switch (opt) {
 		case 'h':
 			usage(argc, argv, 0);
@@ -1619,6 +1773,7 @@ int main(int argc, char* argv[]) {
 
 		case 'd':
 			client->flags |= FLAG_DEBUG;
+			client->debug_level++;
 			break;
 
 		case 'e':
@@ -1629,8 +1784,36 @@ int main(int argc, char* argv[]) {
 			client->flags |= FLAG_CUSTOM;
 			break;
 
-		case 's':
-			client->tss_url = strdup("http://cydia.saurik.com/TSS/controller?action=2");
+		case 's': {
+			if (!*optarg) {
+				error("ERROR: URL argument for --server must not be empty!\n");
+				usage(argc, argv, 1);
+				return EXIT_FAILURE;
+			}
+			char *baseurl = NULL;
+			if (!strncmp(optarg, "http://", 7) && (strlen(optarg) > 7) && (optarg[7] != '/')) {
+				baseurl = optarg+7;
+			} else if (!strncmp(optarg, "https://", 8) && (strlen(optarg) > 8) && (optarg[8] != '/')) {
+				baseurl = optarg+8;
+			}
+			if (baseurl) {
+				char *p = strchr(baseurl, '/');
+				if (!p || *(p+1) == '\0') {
+					// no path component, add default path
+					const char default_path[] = "/TSS/controller?action=2";
+					size_t usize = strlen(optarg)+sizeof(default_path);
+					char* newurl = malloc(usize);
+					snprintf(newurl, usize, "%s%s", optarg, (p) ? default_path+1 : default_path);
+					client->tss_url = newurl;
+				} else {
+					client->tss_url = strdup(optarg);
+				}
+			} else {
+				error("ERROR: URL argument for --server is invalid, must start with http:// or https://\n");
+				usage(argc, argv, 1);
+				return EXIT_FAILURE;
+			}
+		}
 			break;
 
 		case 'x':
@@ -1701,7 +1884,7 @@ int main(int argc, char* argv[]) {
 			break;
 
 		case 'v':
-			info("%s %s\n", PACKAGE_NAME, PACKAGE_VERSION);
+			info("%s %s (libirecovery %s, libtatsu %s)\n", PACKAGE_NAME, PACKAGE_VERSION, irecv_version(), libtatsu_version());
 			return EXIT_SUCCESS;
 
 		case 'T': {
@@ -1759,10 +1942,15 @@ int main(int argc, char* argv[]) {
 		return EXIT_FAILURE;
 	}
 
-	info("%s %s\n", PACKAGE_NAME, PACKAGE_VERSION);
+	info("%s %s (libirecovery %s, libtatsu %s)\n", PACKAGE_NAME, PACKAGE_VERSION, irecv_version(), libtatsu_version());
 
 	if (ipsw) {
-		client->ipsw = strdup(ipsw);
+		// verify if ipsw file exists
+		client->ipsw = ipsw_open(ipsw);
+		if (!client->ipsw) {
+			error("ERROR: Firmware file %s cannot be opened.\n", ipsw);
+			return -1;
+		}
 	}
 
 	curl_global_init(CURL_GLOBAL_ALL);
@@ -1793,6 +1981,7 @@ irecv_device_t get_irecv_device(struct idevicerestore_client_t *client)
 		return normal_get_irecv_device(client);
 
 	case _MODE_DFU:
+	case _MODE_PORTDFU:
 	case _MODE_RECOVERY:
 		return dfu_get_irecv_device(client);
 
@@ -1830,7 +2019,7 @@ int is_image4_supported(struct idevicerestore_client_t* client)
 	return res;
 }
 
-int get_ap_nonce(struct idevicerestore_client_t* client, unsigned char** nonce, int* nonce_size)
+int get_ap_nonce(struct idevicerestore_client_t* client, unsigned char** nonce, unsigned int* nonce_size)
 {
 	int mode = _MODE_UNKNOWN;
 
@@ -1881,7 +2070,7 @@ int get_ap_nonce(struct idevicerestore_client_t* client, unsigned char** nonce, 
 	return 0;
 }
 
-int get_sep_nonce(struct idevicerestore_client_t* client, unsigned char** nonce, int* nonce_size)
+int get_sep_nonce(struct idevicerestore_client_t* client, unsigned char** nonce, unsigned int* nonce_size)
 {
 	int mode = _MODE_UNKNOWN;
 
@@ -2001,7 +2190,7 @@ int get_preboard_manifest(struct idevicerestore_client_t* client, plist_t build_
 	plist_t overrides = plist_new_dict();
 	plist_dict_set_item(overrides, "@APTicket", plist_new_bool(1));
 	plist_dict_set_item(overrides, "ApProductionMode", plist_new_uint(0));
-	plist_dict_set_item(overrides, "ApSecurityDomain", plist_new_uint(0));
+	plist_dict_set_item(overrides, "ApSecurityDomain", plist_new_uint(1));
 
 	plist_dict_set_item(parameters, "ApProductionMode", plist_new_bool(0));
 	plist_dict_set_item(parameters, "ApSecurityMode", plist_new_bool(0));
@@ -2060,9 +2249,9 @@ int get_tss_response(struct idevicerestore_client_t* client, plist_t build_ident
 		char zfn[1024];
 		if (client->version) {
 			if (client->cache_dir) {
-				sprintf(zfn, "%s/shsh/%" PRIu64 "-%s-%s.shsh", client->cache_dir, client->ecid, client->device->product_type, client->version);
+				snprintf(zfn, sizeof(zfn), "%s/shsh/%" PRIu64 "-%s-%s.shsh", client->cache_dir, client->ecid, client->device->product_type, client->version);
 			} else {
-				sprintf(zfn, "shsh/%" PRIu64 "-%s-%s.shsh", client->ecid, client->device->product_type, client->version);
+				snprintf(zfn, sizeof(zfn), "shsh/%" PRIu64 "-%s-%s.shsh", client->ecid, client->device->product_type, client->version);
 			}
 			struct stat fst;
 			if (stat(zfn, &fst) == 0) {
@@ -2117,17 +2306,21 @@ int get_tss_response(struct idevicerestore_client_t* client, plist_t build_ident
 
 	/* populate parameters */
 	plist_t parameters = plist_new_dict();
+	plist_dict_merge(&parameters, client->parameters);
+
 	plist_dict_set_item(parameters, "ApECID", plist_new_uint(client->ecid));
 	if (client->nonce) {
 		plist_dict_set_item(parameters, "ApNonce", plist_new_data((const char*)client->nonce, client->nonce_size));
 	}
-	unsigned char* sep_nonce = NULL;
-	int sep_nonce_size = 0;
-	get_sep_nonce(client, &sep_nonce, &sep_nonce_size);
 
-	if (sep_nonce) {
-		plist_dict_set_item(parameters, "ApSepNonce", plist_new_data((const char*)sep_nonce, sep_nonce_size));
-		free(sep_nonce);
+	if (!plist_dict_get_item(parameters, "SepNonce")) {
+		unsigned char* sep_nonce = NULL;
+		unsigned int sep_nonce_size = 0;
+		get_sep_nonce(client, &sep_nonce, &sep_nonce_size);
+		if (sep_nonce) {
+			plist_dict_set_item(parameters, "ApSepNonce", plist_new_data((const char*)sep_nonce, sep_nonce_size));
+			free(sep_nonce);
+		}
 	}
 
 	plist_dict_set_item(parameters, "ApProductionMode", plist_new_bool(1));
@@ -2185,27 +2378,31 @@ int get_tss_response(struct idevicerestore_client_t* client, plist_t build_ident
 	if (client->mode == MODE_NORMAL) {
 		/* normal mode; request baseband ticket aswell */
 		plist_t pinfo = NULL;
-		normal_get_preflight_info(client, &pinfo);
+		normal_get_firmware_preflight_info(client, &pinfo);
 		if (pinfo) {
-			_plist_dict_copy_data(parameters, pinfo, "BbNonce", "Nonce");
-			_plist_dict_copy_uint(parameters, pinfo, "BbChipID", "ChipID");
-			_plist_dict_copy_uint(parameters, pinfo, "BbGoldCertId", "CertID");
-			_plist_dict_copy_data(parameters, pinfo, "BbSNUM", "ChipSerialNo");
+			plist_dict_copy_data(parameters, pinfo, "BbNonce", "Nonce");
+			plist_dict_copy_uint(parameters, pinfo, "BbChipID", "ChipID");
+			plist_dict_copy_uint(parameters, pinfo, "BbGoldCertId", "CertID");
+			plist_dict_copy_data(parameters, pinfo, "BbSNUM", "ChipSerialNo");
 
 			/* add baseband parameters */
 			tss_request_add_baseband_tags(request, parameters, NULL);
 
-			_plist_dict_copy_uint(parameters, pinfo, "eUICC,ChipID", "EUICCChipID");
-			if (_plist_dict_get_uint(parameters, "eUICC,ChipID") >= 5) {
-				_plist_dict_copy_data(parameters, pinfo, "eUICC,EID", "EUICCCSN");
-				_plist_dict_copy_data(parameters, pinfo, "eUICC,RootKeyIdentifier", "EUICCCertIdentifier");
-				_plist_dict_copy_data(parameters, pinfo, "EUICCGoldNonce", NULL);
-				_plist_dict_copy_data(parameters, pinfo, "EUICCMainNonce", NULL);
+			plist_dict_copy_uint(parameters, pinfo, "eUICC,ChipID", "EUICCChipID");
+			if (plist_dict_get_uint(parameters, "eUICC,ChipID") >= 5) {
+				plist_dict_copy_data(parameters, pinfo, "eUICC,EID", "EUICCCSN");
+				plist_dict_copy_data(parameters, pinfo, "eUICC,RootKeyIdentifier", "EUICCCertIdentifier");
+				plist_dict_copy_data(parameters, pinfo, "EUICCGoldNonce", NULL);
+				plist_dict_copy_data(parameters, pinfo, "EUICCMainNonce", NULL);
 
 				/* add vinyl parameters */
 				tss_request_add_vinyl_tags(request, parameters, NULL);
 			}
 		}
+		client->firmware_preflight_info = pinfo;
+		pinfo = NULL;
+
+		normal_get_preflight_info(client, &pinfo);
 		client->preflight_info = pinfo;
 	}
 
@@ -2246,7 +2443,7 @@ int get_recoveryos_root_ticket_tss_response(struct idevicerestore_client_t* clie
 		plist_dict_set_item(parameters, "ApNonce", plist_new_data((const char*)client->nonce, client->nonce_size));
 	}
 	unsigned char* sep_nonce = NULL;
-	int sep_nonce_size = 0;
+	unsigned int sep_nonce_size = 0;
 	get_sep_nonce(client, &sep_nonce, &sep_nonce_size);
 
 	/* ApSepNonce */
@@ -2269,7 +2466,7 @@ int get_recoveryos_root_ticket_tss_response(struct idevicerestore_client_t* clie
 	tss_parameters_add_from_manifest(parameters, build_identity, true);
 
 	/* create basic request */
-	/* Adds @BBTicket, @HostPlatformInfo, @VersionInfo, @UUID */
+	/* Adds @HostPlatformInfo, @VersionInfo, @UUID */
 	request = tss_request_new(NULL);
 	if (request == NULL) {
 		error("ERROR: Unable to create TSS request\n");
@@ -2278,7 +2475,7 @@ int get_recoveryos_root_ticket_tss_response(struct idevicerestore_client_t* clie
 	}
 
 	/* add common tags from manifest */
-	/* Adds Ap,OSLongVersion, AppNonce, @ApImg4Ticket */
+	/* Adds Ap,OSLongVersion, ApNonce, @ApImg4Ticket */
 	if (tss_request_add_ap_img4_tags(request, parameters) < 0) {
 		error("ERROR: Unable to add AP IMG4 tags to TSS request\n");
 		plist_free(request);
@@ -2350,14 +2547,14 @@ int get_recovery_os_local_policy_tss_response(
 
 	// Add Ap,LocalPolicy
 	uint8_t digest[SHA384_DIGEST_LENGTH];
-	SHA384(lpol_file, lpol_file_length, digest);
+	sha384(lpol_file, lpol_file_length, digest);
 	plist_t lpol = plist_new_dict();
 	plist_dict_set_item(lpol, "Digest", plist_new_data((char*)digest, SHA384_DIGEST_LENGTH));
 	plist_dict_set_item(lpol, "Trusted", plist_new_bool(1));
 	plist_dict_set_item(parameters, "Ap,LocalPolicy", lpol);
 
-	_plist_dict_copy_data(parameters, args, "Ap,NextStageIM4MHash", NULL);
-	_plist_dict_copy_data(parameters, args, "Ap,RecoveryOSPolicyNonceHash", NULL);
+	plist_dict_copy_data(parameters, args, "Ap,NextStageIM4MHash", NULL);
+	plist_dict_copy_data(parameters, args, "Ap,RecoveryOSPolicyNonceHash", NULL);
 
 	plist_t vol_uuid_node = plist_dict_get_item(args, "Ap,VolumeUUID");
 	char* vol_uuid_str = NULL;
@@ -2425,7 +2622,7 @@ int get_local_policy_tss_response(struct idevicerestore_client_t* client, plist_
 		plist_dict_set_item(parameters, "ApNonce", plist_new_data((const char*)client->nonce, client->nonce_size));
 	}
 	unsigned char* sep_nonce = NULL;
-	int sep_nonce_size = 0;
+	unsigned int sep_nonce_size = 0;
 	get_sep_nonce(client, &sep_nonce, &sep_nonce_size);
 
 	if (sep_nonce) {
@@ -2445,7 +2642,7 @@ int get_local_policy_tss_response(struct idevicerestore_client_t* client, plist_
 
 	// Add Ap,LocalPolicy
 	uint8_t digest[SHA384_DIGEST_LENGTH];
-	SHA384(lpol_file, lpol_file_length, digest);
+	sha384(lpol_file, lpol_file_length, digest);
 	plist_t lpol = plist_new_dict();
 	plist_dict_set_item(lpol, "Digest", plist_new_data((char*)digest, SHA384_DIGEST_LENGTH));
 	plist_dict_set_item(lpol, "Trusted", plist_new_bool(1));
@@ -2458,7 +2655,7 @@ int get_local_policy_tss_response(struct idevicerestore_client_t* client, plist_
 	tss_response_get_ap_img4_ticket(client->tss, &ticket, &ticket_length);
 	// Hash it and add it as Ap,NextStageIM4MHash
 	uint8_t hash[SHA384_DIGEST_LENGTH];
-	SHA384(ticket, ticket_length, hash);
+	sha384(ticket, ticket_length, hash);
 	plist_dict_set_item(parameters, "Ap,NextStageIM4MHash", plist_new_data((char*)hash, SHA384_DIGEST_LENGTH));
 
 	/* create basic request */
@@ -2537,7 +2734,7 @@ int build_manifest_get_identity_count(plist_t build_manifest)
 	return plist_array_get_size(build_identities_array);
 }
 
-int extract_component(const char* ipsw, const char* path, unsigned char** component_data, unsigned int* component_size)
+int extract_component(ipsw_archive_t ipsw, const char* path, unsigned char** component_data, unsigned int* component_size)
 {
 	char* component_name = NULL;
 	if (!ipsw || !path || !component_data || !component_size) {
@@ -2552,23 +2749,23 @@ int extract_component(const char* ipsw, const char* path, unsigned char** compon
 
 	info("Extracting %s (%s)...\n", component_name, path);
 	if (ipsw_extract_to_memory(ipsw, path, component_data, component_size) < 0) {
-		error("ERROR: Unable to extract %s from %s\n", component_name, ipsw);
+		error("ERROR: Unable to extract %s from %s\n", component_name, ipsw->path);
 		return -1;
 	}
 
 	return 0;
 }
 
-int personalize_component(const char *component_name, const unsigned char* component_data, unsigned int component_size, plist_t tss_response, unsigned char** personalized_component, unsigned int* personalized_component_size)
+int personalize_component(struct idevicerestore_client_t* client, const char *component_name, const unsigned char* component_data, unsigned int component_size, plist_t tss_response, unsigned char** personalized_component, unsigned int* personalized_component_size)
 {
 	unsigned char* component_blob = NULL;
 	unsigned int component_blob_size = 0;
 	unsigned char* stitched_component = NULL;
 	unsigned int stitched_component_size = 0;
 
-	if (tss_response && tss_response_get_ap_img4_ticket(tss_response, &component_blob, &component_blob_size) == 0) {
+	if (tss_response && plist_dict_get_item(tss_response, "ApImg4Ticket")) {
 		/* stitch ApImg4Ticket into IMG4 file */
-		img4_stitch_component(component_name, component_data, component_size, component_blob, component_blob_size, &stitched_component, &stitched_component_size);
+		img4_stitch_component(component_name, component_data, component_size, client->parameters, tss_response, &stitched_component, &stitched_component_size);
 	} else {
 		/* try to get blob for current component from tss response */
 		if (tss_response && tss_response_get_blob_by_entry(tss_response, component_name, &component_blob) < 0) {
@@ -2685,7 +2882,7 @@ void build_identity_print_information(plist_t build_identity)
 	node = NULL;
 }
 
-int build_identity_check_components_in_ipsw(plist_t build_identity, const char *ipsw)
+int build_identity_check_components_in_ipsw(plist_t build_identity, ipsw_archive_t ipsw)
 {
 	plist_t manifest_node = plist_dict_get_item(build_identity, "Manifest");
 	if (!manifest_node || plist_get_node_type(manifest_node) != PLIST_DICT) {

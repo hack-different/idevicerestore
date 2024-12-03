@@ -29,8 +29,9 @@
 #include <libimobiledevice/restore.h>
 #include <libimobiledevice/libimobiledevice.h>
 
+#include <libtatsu/tss.h>
+
 #include "idevicerestore.h"
-#include "tss.h"
 #include "img3.h"
 #include "restore.h"
 #include "recovery.h"
@@ -157,6 +158,20 @@ int recovery_enter_restore(struct idevicerestore_client_t* client, plist_t build
 	info("iBoot build-style=%s\n", (value) ? value : "(unknown)");
 	free(value);
 	value = NULL;
+
+	unsigned long boot_stage = 0;
+	irecv_getenv(client->recovery->client, "boot-stage", &value);
+	if (value) {
+		boot_stage = strtoul(value, NULL, 0);
+	}
+	if (boot_stage > 0) {
+		info("iBoot boot-stage=%s\n", value);
+		free(value);
+		value = NULL;
+		if (boot_stage != 2) {
+			error("ERROR: iBoot should be at boot stage 2, continuing anyway...\n");
+		}
+	}
 
 	unsigned long radio_error = 0;
 	irecv_getenv(client->recovery->client, "radio-error", &value);
@@ -290,7 +305,7 @@ int recovery_send_component(struct idevicerestore_client_t* client, plist_t buil
 		return -1;
 	}
 
-	ret = personalize_component(component, component_data, component_size, client->tss, &data, &size);
+	ret = personalize_component(client, component, component_data, component_size, client->tss, &data, &size);
 	free(component_data);
 	if (ret < 0) {
 		error("ERROR: Unable to get personalized component: %s\n", component);
@@ -344,7 +359,7 @@ int recovery_send_ibec(struct idevicerestore_client_t* client, plist_t build_ide
 		return -1;
 	}
 
-	recovery_error = irecv_send_command(client->recovery->client, "go");
+	recovery_error = irecv_send_command_breq(client->recovery->client, "go", 1);
 	if (recovery_error != IRECV_E_SUCCESS) {
 		error("ERROR: Unable to execute %s\n", component);
 		return -1;
@@ -498,7 +513,7 @@ int recovery_send_kernelcache(struct idevicerestore_client_t* client, plist_t bu
 		recovery_error = irecv_send_command(client->recovery->client, setba);
 	}
 
-	recovery_error = irecv_send_command(client->recovery->client, "bootx");
+	recovery_error = irecv_send_command_breq(client->recovery->client, "bootx", 1);
 	if (recovery_error != IRECV_E_SUCCESS) {
 		error("ERROR: Unable to execute %s\n", component);
 		return -1;
@@ -523,7 +538,7 @@ int recovery_is_image4_supported(struct idevicerestore_client_t* client)
 	return (device_info->ibfl & IBOOT_FLAG_IMAGE4_AWARE);
 }
 
-int recovery_get_ap_nonce(struct idevicerestore_client_t* client, unsigned char** nonce, int* nonce_size)
+int recovery_get_ap_nonce(struct idevicerestore_client_t* client, unsigned char** nonce, unsigned int* nonce_size)
 {
 	if(client->recovery == NULL) {
 		if (recovery_client_new(client) < 0) {
@@ -548,7 +563,7 @@ int recovery_get_ap_nonce(struct idevicerestore_client_t* client, unsigned char*
 	return 0;
 }
 
-int recovery_get_sep_nonce(struct idevicerestore_client_t* client, unsigned char** nonce, int* nonce_size)
+int recovery_get_sep_nonce(struct idevicerestore_client_t* client, unsigned char** nonce, unsigned int* nonce_size)
 {
 	if(client->recovery == NULL) {
 		if (recovery_client_new(client) < 0) {
@@ -575,7 +590,7 @@ int recovery_get_sep_nonce(struct idevicerestore_client_t* client, unsigned char
 
 int recovery_send_reset(struct idevicerestore_client_t* client)
 {
-	irecv_send_command(client->recovery->client, "reset");
+	irecv_send_command_breq(client->recovery->client, "reset", 1);
 	return 0;
 }
 

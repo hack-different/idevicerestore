@@ -22,8 +22,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <libtatsu/tss.h>
+
 #include "common.h"
 #include "img4.h"
+#include "endianness.h"
 
 #define ASN1_PRIVATE 0xc0
 #define ASN1_PRIMITIVE_TAG 0x1f
@@ -201,7 +204,7 @@ static void asn1_write_element(unsigned char **p, unsigned int *length, unsigned
 		}
 	}	break;
 	default:
-		fprintf(stderr, "ERROR: %s: type %02x is not implemented", __func__, type);
+		fprintf(stderr, "ERROR: %s: type %02x is not implemented\n", __func__, type);
 		return;
 	}
 }
@@ -275,28 +278,37 @@ static const char *_img4_get_component_tag(const char *compname)
 		{ "ACIBT", "acib" },
 		{ "ACIBTLPEM", "lpbt" },
 		{ "ACIWIFI", "aciw" },
-		{ "Alamo", "almo" },
 		{ "ANE", "anef" },
 		{ "ANS", "ansf" },
 		{ "AOP", "aopf" },
+		{ "AVE", "avef" },
+		{ "Alamo", "almo" },
+		{ "Ap,ANE1", "ane1" },
+		{ "Ap,ANE2", "ane2" },
+		{ "Ap,ANE3", "ane3" },
 		{ "Ap,AudioAccessibilityBootChime", "auac" },
 		{ "Ap,AudioBootChime", "aubt" },
 		{ "Ap,AudioPowerAttachChime", "aupr" },
+		{ "Ap,BootabilityBrainTrustCache", "trbb" },
 		{ "Ap,CIO", "ciof" },
 		{ "Ap,HapticAssets", "hpas" },
 		{ "Ap,LocalBoot", "lobo" },
 		{ "Ap,LocalPolicy", "lpol" },
 		{ "Ap,NextStageIM4MHash", "nsih" },
 		{ "Ap,RecoveryOSPolicyNonceHash", "ronh" },
+		{ "Ap,RestoreANE1", "ran1" },
+		{ "Ap,RestoreANE2", "ran2" },
+		{ "Ap,RestoreANE3", "ran3" },
 		{ "Ap,RestoreCIO", "rcio" },
 		{ "Ap,RestoreTMU", "rtmu" },
 		{ "Ap,Scorpius", "scpf" },
 		{ "Ap,SystemVolumeCanonicalMetadata", "msys" },
 		{ "Ap,TMU", "tmuf" },
 		{ "Ap,VolumeUUID", "vuid" },
+		{ "Ap,rOSLogo1", "rlg1" },
+		{ "Ap,rOSLogo2", "rlg2" },
 		{ "AppleLogo", "logo" },
 		{ "AudioCodecFirmware", "acfw" },
-		{ "AVE", "avef" },
 		{ "BatteryCharging", "glyC" },
 		{ "BatteryCharging0", "chg0" },
 		{ "BatteryCharging1", "chg1" },
@@ -305,28 +317,22 @@ static const char *_img4_get_component_tag(const char *compname)
 		{ "BatteryLow1", "bat1" },
 		{ "BatteryPlugin", "glyP" },
 		{ "CFELoader", "cfel" },
-		{ "Dali", "dali" },
+		{ "CrownFirmware", "crwn" },
 		{ "DCP", "dcpf" },
+		{ "Dali", "dali" },
 		{ "DeviceTree", "dtre" },
 		{ "Diags", "diag" },
 		{ "EngineeringTrustCache", "dtrs" },
 		{ "ExtDCP", "edcp" },
-		{ "ftap", "ftap" },
-		{ "ftsp", "ftsp" },
 		{ "GFX", "gfxf" },
 		{ "Hamm", "hamf" },
 		{ "Homer", "homr" },
-		{ "iBEC", "ibec" },
-		{ "iBoot", "ibot" },
-		{ "iBootData", "ibdt" },
-		{ "iBootTest", "itst" },
-		{ "iBSS", "ibss" },
-		{ "InputDevice", "ipdf" },
 		{ "ISP", "ispf" },
+		{ "InputDevice", "ipdf" },
 		{ "KernelCache", "krnl" },
+		{ "LLB", "illb" },
 		{ "LeapHaptics", "lphp" },
 		{ "Liquid", "liqd" },
-		{ "LLB", "illb" },
 		{ "LoadableTrustCache", "ltrs" },
 		{ "LowPowerWallet0", "lpw0" },
 		{ "LowPowerWallet1", "lpw1" },
@@ -337,12 +343,13 @@ static const char *_img4_get_component_tag(const char *compname)
 		{ "NeedService", "nsrv" },
 		{ "OS", "OS\0\0" },
 		{ "OSRamdisk", "osrd" },
-		{ "PersonalizedDMG", "pdmg" },
 		{ "PEHammer", "hmmr" },
 		{ "PERTOS", "pert" },
 		{ "PHLEET", "phlt" },
 		{ "PMP", "pmpf" },
+		{ "PersonalizedDMG", "pdmg" },
 		{ "RBM", "rmbt" },
+		{ "RTP", "rtpf" },
 		{ "Rap,SoftwareBinaryDsp1", "sbd1" },
 		{ "Rap,RTKitOS", "rkos" },
 		{ "Rap,RestoreRTKitOS", "rrko" },
@@ -353,12 +360,10 @@ static const char *_img4_get_component_tag(const char *compname)
 		{ "RestoreExtDCP", "recp" },
 		{ "RestoreKernelCache", "rkrn" },
 		{ "RestoreLogo", "rlgo" },
+		{ "RestoreRTP", "rrtp" },
 		{ "RestoreRamDisk", "rdsk" },
 		{ "RestoreSEP", "rsep" },
 		{ "RestoreTrustCache", "rtsc" },
-		{ "rfta", "rfta" },
-		{ "rfts", "rfts" },
-		{ "RTP", "rtpf" },
 		{ "SCE", "scef" },
 		{ "SCE1Firmware", "sc1f" },
 		{ "SEP", "sepi" },
@@ -367,6 +372,16 @@ static const char *_img4_get_component_tag(const char *compname)
 		{ "SystemLocker", "lckr" },
 		{ "SystemVolume", "isys" },
 		{ "WCHFirmwareUpdater", "wchf" },
+		{ "ftap", "ftap" },
+		{ "ftsp", "ftsp" },
+		{ "iBEC", "ibec" },
+		{ "iBSS", "ibss" },
+		{ "iBoot", "ibot" },
+		{ "iBootData", "ibdt" },
+		{ "iBootDataStage1", "ibd1" },
+		{ "iBootTest", "itst" },
+		{ "rfta", "rfta" },
+		{ "rfts", "rfts" },
 		{ NULL, NULL }
 	};
 	int i = 0;
@@ -381,7 +396,7 @@ static const char *_img4_get_component_tag(const char *compname)
 	return NULL;
 }
 
-int img4_stitch_component(const char* component_name, const unsigned char* component_data, unsigned int component_size, const unsigned char* blob, unsigned int blob_size, unsigned char** img4_data, unsigned int *img4_size)
+int img4_stitch_component(const char* component_name, const unsigned char* component_data, unsigned int component_size, plist_t parameters, plist_t tss_response, unsigned char** img4_data, unsigned int *img4_size)
 {
 	unsigned char* magic_header = NULL;
 	unsigned int magic_header_size = 0;
@@ -392,8 +407,15 @@ int img4_stitch_component(const char* component_name, const unsigned char* compo
 	unsigned int content_size;
 	unsigned char* outbuf;
 	unsigned char* p;
+	unsigned char* blob = NULL;
+	unsigned int blob_size = 0;
 
-	if (!component_name || !component_data || component_size == 0 || !blob || blob_size == 0 || !img4_data || !img4_size) {
+	if (!component_name || !component_data || component_size == 0 || !tss_response || !img4_data || !img4_size) {
+		return -1;
+	}
+
+	if (tss_response_get_ap_img4_ticket(tss_response, &blob, &blob_size) != 0) {
+		error("ERROR: %s: Failed to get ApImg4Ticket from TSS response\n", __func__);
 		return -1;
 	}
 
@@ -420,7 +442,222 @@ int img4_stitch_component(const char* component_name, const unsigned char* compo
 			memcpy((void*)tag, "rcio", 4);
 		} else if (strcmp(component_name, "Ap,DCP2") == 0) {
 			memcpy((void*)tag, "dcp2", 4);
+		} else if (strcmp(component_name, "Ap,RestoreSecureM3Firmware") == 0) {
+			memcpy((void*)tag, "rsm3", 4);
+		} else if (strcmp(component_name, "Ap,RestoreSecurePageTableMonitor") == 0) {
+			memcpy((void*)tag, "rspt", 4);
+		} else if (strcmp(component_name, "Ap,RestoreTrustedExecutionMonitor") == 0) {
+			memcpy((void*)tag, "rtrx", 4);
+		} else if (strcmp(component_name, "Ap,RestorecL4") == 0) {
+			memcpy((void*)tag, "rxcl", 4);
 		}
+	}
+
+	// check if we have a *-TBM entry for the given component
+	unsigned char *additional_data = NULL;
+	unsigned int additional_size = 0;
+	char *tbm_key = malloc(strlen(component_name) + 5);
+	snprintf(tbm_key, strlen(component_name)+5, "%s-TBM", component_name);
+	plist_t tbm_dict = plist_dict_get_item(tss_response, tbm_key);
+	free(tbm_key);
+	uint64_t ucon_size = 0;
+	const char* ucon_data = NULL;
+	uint64_t ucer_size = 0;
+	const char* ucer_data = NULL;
+	if (tbm_dict) {
+		plist_t dt = plist_dict_get_item(tbm_dict, "ucon");
+		if (!dt) {
+			error("ERROR: %s: Missing ucon node in %s-TBM dictionary\n", __func__, component_name);
+			return -1;
+		}
+		ucon_data = plist_get_data_ptr(dt, &ucon_size);
+		if (!ucon_data) {
+			error("ERROR: %s: Missing ucon data in %s-TBM dictionary\n", __func__, component_name);
+			return -1;
+		}
+		dt = plist_dict_get_item(tbm_dict, "ucer");
+		if (!dt) {
+			error("ERROR: %s: Missing ucer data node in %s-TBM dictionary\n", __func__, component_name);
+			return -1;
+		}
+		ucer_data = plist_get_data_ptr(dt, &ucer_size);
+		if (!ucer_data) {
+			error("ERROR: %s: Missing ucer data in %s-TBM dictionary\n", __func__, component_name);
+			return -1;
+		}
+	}
+
+	int nonce_slot_required = plist_dict_get_bool(parameters, "RequiresNonceSlot") && (!strcmp(component_name, "SEP") || !strcmp(component_name, "SepStage1") || !strcmp(component_name, "LLB"));
+
+	if (ucon_data || ucer_data || nonce_slot_required) {
+		size_t im4r_size = 16;
+		if (ucon_data) {
+			im4r_size += 8 + 8 + ucon_size + 16;
+		}
+		if (ucer_data) {
+			im4r_size += 8 + 8 + ucer_size + 16;
+		}
+		if (nonce_slot_required) {
+			im4r_size += 16;
+		}
+		unsigned char *im4rset = (unsigned char*)malloc(im4r_size);
+		unsigned char *p_im4rset = im4rset;
+		unsigned int im4rlen = 0;
+
+		// ----------- anid/snid -------
+		if (nonce_slot_required) {
+			const char* tag_name = NULL;
+			uint64_t tag_value = 0;
+			if (!strcmp(component_name, "SEP") || !strcmp(component_name, "SepStage1")) {
+				tag_name = "snid";
+				tag_value = 2;
+				if (plist_dict_get_item(parameters, "SepNonceSlotID")) {
+					tag_value = plist_dict_get_uint(parameters, "SepNonceSlotID");
+				}
+			} else {
+				tag_name = "anid";
+				tag_value = 0;
+				if (plist_dict_get_item(parameters, "ApNonceSlotID")) {
+					tag_value = plist_dict_get_uint(parameters, "ApNonceSlotID");
+				}
+			}
+			// write priv anid/snid element
+			asn1_write_priv_element(&p_im4rset, &im4rlen, __bswap_32(*(uint32_t*)tag_name));
+			// write anid/snid IA5STRING and anid/snid value
+			unsigned char inner_seq[16];
+			unsigned char *p_inner_seq = &inner_seq[0];
+			unsigned int inner_seq_hdr_len = 0;
+			asn1_write_element(&p_inner_seq, &inner_seq_hdr_len, ASN1_IA5_STRING, (void*)tag_name, -1);
+			asn1_write_element(&p_inner_seq, &inner_seq_hdr_len, ASN1_INTEGER, (void*)&tag_value, -1);
+
+			// write anid/snid sequence
+			unsigned char elem_seq[8];
+			unsigned char *p = &elem_seq[0];
+			unsigned int seq_hdr_len = 0;
+			asn1_write_element_header(ASN1_SEQUENCE | ASN1_CONSTRUCTED, inner_seq_hdr_len, &p, &seq_hdr_len);
+
+			// add size to priv anid/snid element
+			asn1_write_size(inner_seq_hdr_len + seq_hdr_len, &p_im4rset, &im4rlen);
+
+			// put it together
+			memcpy(p_im4rset, elem_seq, seq_hdr_len);
+			p_im4rset += seq_hdr_len;
+			im4rlen += seq_hdr_len;
+			memcpy(p_im4rset, inner_seq, inner_seq_hdr_len);
+			p_im4rset += inner_seq_hdr_len;
+			im4rlen += inner_seq_hdr_len;
+		}
+
+		// ----------- ucon ------------
+		if (ucon_data) {
+			// write priv ucon element
+			asn1_write_priv_element(&p_im4rset, &im4rlen, *(uint32_t*)"nocu");
+
+			// write ucon IA5STRING and ucon data header
+			unsigned char inner_seq[16];
+			unsigned char *p_inner_seq = &inner_seq[0];
+			unsigned int inner_seq_hdr_len = 0;
+			asn1_write_element(&p_inner_seq, &inner_seq_hdr_len, ASN1_IA5_STRING, (void*)"ucon", -1);
+			asn1_write_element_header(ASN1_OCTET_STRING, ucon_size, &p_inner_seq, &inner_seq_hdr_len);
+
+			// write ucon sequence
+			unsigned char elem_seq[8];
+			unsigned char *p = &elem_seq[0];
+			unsigned int seq_hdr_len = 0;
+			asn1_write_element_header(ASN1_SEQUENCE | ASN1_CONSTRUCTED, inner_seq_hdr_len + ucon_size, &p, &seq_hdr_len);
+
+			// add size to priv ucon element
+			asn1_write_size(inner_seq_hdr_len + ucon_size + seq_hdr_len, &p_im4rset, &im4rlen);
+
+			// put it together
+			memcpy(p_im4rset, elem_seq, seq_hdr_len);
+			p_im4rset += seq_hdr_len;
+			im4rlen += seq_hdr_len;
+			memcpy(p_im4rset, inner_seq, inner_seq_hdr_len);
+			p_im4rset += inner_seq_hdr_len;
+			im4rlen += inner_seq_hdr_len;
+			// write ucon data
+			memcpy(p_im4rset, ucon_data, ucon_size);
+			p_im4rset += ucon_size;
+			im4rlen += ucon_size;
+		}
+
+		// ----------- ucer ------------
+		if (ucer_data) {
+			// write priv ucer element
+			asn1_write_priv_element(&p_im4rset, &im4rlen, *(uint32_t*)"recu");
+
+			// write ucer IA5STRING and ucer data header
+			unsigned char inner_seq[16];
+			unsigned char *p_inner_seq = &inner_seq[0];
+			unsigned int inner_seq_hdr_len = 0;
+			asn1_write_element(&p_inner_seq, &inner_seq_hdr_len, ASN1_IA5_STRING, (void*)"ucer", -1);
+			asn1_write_element_header(ASN1_OCTET_STRING, ucer_size, &p_inner_seq, &inner_seq_hdr_len);
+
+			// write ucer sequence
+			unsigned char elem_seq[8];
+			unsigned char *p = &elem_seq[0];
+			unsigned int seq_hdr_len = 0;
+			asn1_write_element_header(ASN1_SEQUENCE | ASN1_CONSTRUCTED, inner_seq_hdr_len + ucer_size, &p, &seq_hdr_len);
+
+			// add size to priv ucer element
+			asn1_write_size(inner_seq_hdr_len + ucer_size + seq_hdr_len, &p_im4rset, &im4rlen);
+
+			// put it together
+			memcpy(p_im4rset, elem_seq, seq_hdr_len);
+			p_im4rset += seq_hdr_len;
+			im4rlen += seq_hdr_len;
+			memcpy(p_im4rset, inner_seq, inner_seq_hdr_len);
+			p_im4rset += inner_seq_hdr_len;
+			im4rlen += inner_seq_hdr_len;
+			// write ucer data
+			memcpy(p_im4rset, ucer_data, ucer_size);
+			p_im4rset += ucer_size;
+			im4rlen += ucer_size;
+		}
+
+		// now construct IM4R
+
+		/* write inner set */
+		unsigned char inner_set_[8];
+		unsigned char *inner_set = &inner_set_[0];
+		unsigned int inner_set_len = 0;
+		asn1_write_element_header(ASN1_SET | ASN1_CONSTRUCTED, im4rlen, &inner_set, &inner_set_len);
+
+		/* write header values */
+		unsigned char hdrdata_[16];
+		unsigned char *hdrdata = &hdrdata_[0];
+		unsigned int hdrdata_len = 0;
+		asn1_write_element(&hdrdata, &hdrdata_len, ASN1_IA5_STRING, (void*)"IM4R", -1);
+
+		/* write sequence now that we know the entire size */
+		unsigned char seq_[8];
+		unsigned char *seq = &seq_[0];
+		unsigned int seq_len = 0;
+		asn1_write_element_header(ASN1_SEQUENCE | ASN1_CONSTRUCTED, im4rlen + inner_set_len + hdrdata_len, &seq, &seq_len);
+
+		/* write outer cont[1] */
+		unsigned char cont_[8];
+		unsigned char *cont = &cont_[0];
+		unsigned int cont_len = 0;
+		asn1_write_element_header(ASN1_CONTEXT_SPECIFIC | ASN1_CONSTRUCTED | 1, im4rlen + inner_set_len + hdrdata_len + seq_len, &cont, &cont_len);
+
+		// now put everything together
+		additional_data = malloc(im4rlen + inner_set_len + hdrdata_len + seq_len + cont_len);
+		p = additional_data;
+		memcpy(p, cont_, cont_len);
+		p += cont_len;
+		memcpy(p, seq_, seq_len);
+		p += seq_len;
+		memcpy(p, hdrdata_, hdrdata_len);
+		p += hdrdata_len;
+		memcpy(p, inner_set_, inner_set_len);
+		p += inner_set_len;
+		memcpy(p, im4rset, im4rlen);
+		p += im4rlen;
+		additional_size = (unsigned int)(p - additional_data);
+
+		free(im4rset);
 	}
 
 	// create element header for the "IMG4" magic
@@ -429,7 +666,7 @@ int img4_stitch_component(const char* component_name, const unsigned char* compo
 	asn1_create_element_header(ASN1_CONTEXT_SPECIFIC|ASN1_CONSTRUCTED, blob_size, &blob_header, &blob_header_size);
 
 	// calculate the size for the final IMG4 file (asn1 sequence)
-	content_size = magic_header_size + IMG4_MAGIC_SIZE + component_size + blob_header_size + blob_size;
+	content_size = magic_header_size + IMG4_MAGIC_SIZE + component_size + blob_header_size + blob_size + additional_size;
 
 	// create element header for the final IMG4 asn1 blob
 	asn1_create_element_header(ASN1_SEQUENCE|ASN1_CONSTRUCTED, content_size, &img4header, &img4header_size);
@@ -445,6 +682,7 @@ int img4_stitch_component(const char* component_name, const unsigned char* compo
 		if (img4header) {
 			free(img4header);
 		}
+		free(additional_data);
 		error("ERROR: out of memory when personalizing IMG4 component %s\n", component_name);
 		return -1;
 	}
@@ -463,6 +701,10 @@ int img4_stitch_component(const char* component_name, const unsigned char* compo
 	p += blob_header_size;
 	memcpy(p, blob, blob_size);
 	p += blob_size;
+	if (additional_size) {
+		memcpy(p, additional_data, additional_size);
+		p += additional_size;
+	}
 
 	*img4_data = outbuf;
 	*img4_size = (p - outbuf);
@@ -476,6 +718,7 @@ int img4_stitch_component(const char* component_name, const unsigned char* compo
 	if (img4header) {
 		free(img4header);
 	}
+	free(additional_data);
 
 	return 0;
 }
@@ -540,13 +783,11 @@ static void _manifest_write_component(unsigned char **p, unsigned int *length, c
 
 	node = plist_dict_get_item(comp, "Digest");
 	if (node) {
-		char *digest = NULL;
 		uint64_t digest_len = 0;
-		plist_get_data_val(node, &digest, &digest_len);
+		const char *digest = plist_get_data_ptr(node, &digest_len);
 		if (digest_len > 0) {
-			_manifest_write_key_value(&tmp, &tmp_len, "DGST", ASN1_OCTET_STRING, digest, digest_len);
+			_manifest_write_key_value(&tmp, &tmp_len, "DGST", ASN1_OCTET_STRING, (void*)digest, digest_len);
 		}
-		free(digest);
 	}
 
 	node = plist_dict_get_item(comp, "Trusted");
@@ -575,9 +816,8 @@ static void _manifest_write_component(unsigned char **p, unsigned int *length, c
 
 	node = plist_dict_get_item(comp, "TBMDigests");
 	if (node) {
-		char *data = NULL;
 		uint64_t datalen = 0;
-		plist_get_data_val(node, &data, &datalen);
+		const char *data = plist_get_data_ptr(node, &datalen);
 		const char *tbmtag = NULL;
 		if (!strcmp(tag, "sepi")) {
 			tbmtag = "tbms";
@@ -587,9 +827,8 @@ static void _manifest_write_component(unsigned char **p, unsigned int *length, c
 		if (!tbmtag) {
 			error("ERROR: Unexpected TMBDigests for comp '%s'\n", tag);
 		} else {
-			_manifest_write_key_value(&tmp, &tmp_len, tbmtag, ASN1_OCTET_STRING, data, datalen);
+			_manifest_write_key_value(&tmp, &tmp_len, tbmtag, ASN1_OCTET_STRING, (void*)data, datalen);
 		}
-		free(data);
 	}
 
 	asn1_write_element_header(ASN1_SET | ASN1_CONSTRUCTED, tmp_len, &inner_start, &inner_length);
@@ -633,22 +872,22 @@ int img4_create_local_manifest(plist_t request, plist_t build_identity, plist_t*
 	unsigned int tmp_len = 0;
 
 	/* write manifest properties */
-	uintval = _plist_dict_get_uint(request, "ApBoardID");
+	uintval = plist_dict_get_uint(request, "ApBoardID");
 	_manifest_write_key_value(&tmp, &tmp_len, "BORD", ASN1_INTEGER, &uintval, -1);
 
 	uintval = 0;
 	_manifest_write_key_value(&tmp, &tmp_len, "CEPO", ASN1_INTEGER, &uintval, -1);
 
-	uintval = _plist_dict_get_uint(request, "ApChipID");
+	uintval = plist_dict_get_uint(request, "ApChipID");
 	_manifest_write_key_value(&tmp, &tmp_len, "CHIP", ASN1_INTEGER, &uintval, -1);
 
-	boolval = _plist_dict_get_bool(request, "ApProductionMode");
+	boolval = plist_dict_get_bool(request, "ApProductionMode");
 	_manifest_write_key_value(&tmp, &tmp_len, "CPRO", ASN1_BOOLEAN, &boolval, -1);
 
 	boolval = 0;
 	_manifest_write_key_value(&tmp, &tmp_len, "CSEC", ASN1_BOOLEAN, &boolval, -1);
 
-	uintval = _plist_dict_get_uint(request, "ApSecurityDomain");
+	uintval = plist_dict_get_uint(request, "ApSecurityDomain");
 	_manifest_write_key_value(&tmp, &tmp_len, "SDOM", ASN1_INTEGER, &uintval, -1);
 
 	/* create manifest properties set */
@@ -679,13 +918,12 @@ int img4_create_local_manifest(plist_t request, plist_t build_identity, plist_t*
 				comp = _img4_get_component_tag(key);
 			}
 			if (!comp) {
-				error("ERROR: %s: Unhandled component '%s' - can't create manifest\n", __func__, key);
-				free(iter);
-				free(buf);
-				return -1;
+				debug("DEBUG: %s: Unhandled component '%s'\n", __func__, key);
+				_manifest_write_component(&p, &length, key, val);
+			} else {
+				debug("DEBUG: found component %s (%s)\n", comp, key);
+				_manifest_write_component(&p, &length, comp, val);
 			}
-			debug("DEBUG: found component %s (%s)\n", comp, key);
-			_manifest_write_component(&p, &length, comp, val);
 		}
 		free(key);
 	} while (val);
